@@ -1,5 +1,6 @@
 # ==========================================
 # Wallet Scoring System with Graph Verification
+# Updated: improved scoring, spike-resistant
 # ==========================================
 
 import json
@@ -17,12 +18,12 @@ DATA_DIR = "data/raw"            # partitioned JSON files directory
 OUTPUT_FILE = "data/top_wallets.json"
 LOOKBACK_DAYS = 180
 RECENT_DAYS = 30
-MIN_REALIZED_TRADES = 3
+
+MIN_REALIZED_TRADES = 6 # 10
 MAX_DRAWDOWN = 0.6
 TOP_N = 25
 SECONDS_IN_DAY = 86400
 SHARPE_CAP = 5.0                 # cap to prevent extreme Sharpe scores
-PNL_SMOOTH_DAYS = 30             # smooth over recent trades for PnL
 GRAPH_DIR = "data/graphs"
 TOP_DATA_DIR = "data/top_wallet_data"
 MAX_TRADES = 50  # limit to last 50 trades per wallet
@@ -94,7 +95,6 @@ def load_partitioned_trades(days_back=LOOKBACK_DAYS):
     print(f"Loaded {len(trades)} trades from the last {days_back} days")
     return trades
 
-# ---------- grouping ----------
 def group_wallets(trades, recent_days=RECENT_DAYS):
     now = time.time()
     recent_cutoff = now - recent_days * SECONDS_IN_DAY
@@ -110,67 +110,80 @@ def group_wallets(trades, recent_days=RECENT_DAYS):
 
     return wallets, active_wallets
 
-# ---------- stats ----------
-def compute_stats(trades, smooth_days=PNL_SMOOTH_DAYS):
+# ---------- updated stats ----------
+def compute_stats(trades):
     positions = defaultdict(list)
-    pnl = []
-    buy = sell = 0
-    now = time.time()
-    smooth_cutoff = now - smooth_days * SECONDS_IN_DAY
+    pnl_events = []
 
+    buy = sell = 0
     for t in sorted(trades, key=trade_ts):
         side = t.get("side","").upper()
         size = float(t.get("size",0))
         price = float(t.get("price",0))
+        ts = trade_ts(t)
         key = f"{t.get('market_slug')}:{t.get('outcome')}"
 
-        if side=="BUY":
-            positions[key].append((size,price))
+        if side == "BUY":
+            positions[key].append([size, price])
             buy += 1
-        elif side=="SELL":
+        elif side == "SELL":
             sell += 1
-            rem=size
-            p=0
-            for bsize,bprice in positions[key]:
-                if rem<=0: break
-                take=min(rem,bsize)
-                p += take*(price-bprice)
+            rem = size
+            realized = 0.0
+
+            while rem > 0 and positions[key]:
+                b = positions[key][0]
+                take = min(rem, b[0])
+                realized += take * (price - b[1])
+                b[0] -= take
                 rem -= take
-            if p != 0:
-                ts = trade_ts(t)
-                if ts >= smooth_cutoff:
-                    pnl.append(p)
+                if b[0] <= 0:
+                    positions[key].pop(0)
 
-    if not pnl: return None
+            if realized != 0:
+                pnl_events.append((ts, realized))
 
-    cum = np.cumsum(pnl)
+    if len(pnl_events) < MIN_REALIZED_TRADES:
+        return None
+
+    # group by day
+    daily = defaultdict(float)
+    for ts, p in pnl_events:
+        day = datetime.fromtimestamp(ts, tz=timezone.utc).date()
+        daily[day] += p
+
+    daily_pnl = np.array(list(daily.values()))
+    cap = np.percentile(np.abs(daily_pnl), 95)
+    daily_pnl = np.clip(daily_pnl, -cap, cap)
+
+    cum = np.cumsum(daily_pnl)
     peak = np.maximum.accumulate(cum)
     drawdown = np.max(peak - cum)
-    wins = sum(1 for x in pnl if x>0)
 
-    total_pnl = sum(pnl)
-    sharpe = np.mean(pnl)/(np.std(pnl) or 1)
+    wins = np.sum(daily_pnl > 0)
+    sharpe = (np.mean(daily_pnl) / (np.std(daily_pnl) or 1)) * np.sqrt(365)
     sharpe = min(sharpe, SHARPE_CAP)
 
     return {
-        "total_pnl": total_pnl,
-        "sharpe": sharpe,
+        "total_pnl": float(np.sum(daily_pnl)),
+        "sharpe": float(sharpe),
         "buy_count": buy,
         "sell_count": sell,
-        "num_realized": len(pnl),
-        "max_drawdown": drawdown,
-        "win_rate": wins/len(pnl)
+        "num_realized": len(daily_pnl),
+        "active_days": len(daily),
+        "max_drawdown": float(drawdown),
+        "win_rate": wins / len(daily_pnl)
     }
 
-# ---------- scoring ----------
-def mm(x, lo, hi):
-    return (x-lo)/(hi-lo) if hi>lo else 0
-
+# ---------- updated scoring ----------
 def compute_scores(candidates):
-    pnls = [s["total_pnl"] for _,s in candidates]
-    sharpes = [s["sharpe"] for _,s in candidates]
-    dds = [s["max_drawdown"] for _,s in candidates]
-    activities = [s["buy_count"]+s["sell_count"] for _,s in candidates]
+    def mm(x, lo, hi):
+        return (x - lo) / (hi - lo) if hi > lo else 0
+
+    pnls = [s["total_pnl"] for _, s in candidates]
+    sharpes = [s["sharpe"] for _, s in candidates]
+    dds = [s["max_drawdown"] for _, s in candidates]
+    days = [s["active_days"] for _, s in candidates]
 
     G = {
         "pnl_min": min(pnls),
@@ -178,38 +191,42 @@ def compute_scores(candidates):
         "sh_min": min(sharpes),
         "sh_max": max(sharpes),
         "dd_max": max(dds),
-        "activity_max": max(activities)
+        "days_max": max(days)
     }
 
     def score(s):
         v = 0
-        v += 0.15*mm(s["total_pnl"],G["pnl_min"],G["pnl_max"])
-        v += 0.40*mm(s["sharpe"],G["sh_min"],G["sh_max"])
-        v += 0.20*(1-mm(s["max_drawdown"],0,G["dd_max"]))
-        v += 0.10*mm(s["buy_count"]+s["sell_count"],1,G["activity_max"])
-        v += 0.15*s["win_rate"]
-        multiplier = min(np.log1p(s["num_realized"]),2)
-        v *= multiplier
-        return round(v*100,2)
+        v += 0.25 * mm(s["sharpe"], G["sh_min"], G["sh_max"])
+        v += 0.20 * mm(s["total_pnl"], G["pnl_min"], G["pnl_max"])
+        v += 0.20 * (1 - mm(s["max_drawdown"], 0, G["dd_max"]))
+        v += 0.20 * mm(s["active_days"], 1, G["days_max"])
+        v += 0.15 * s["win_rate"]
+
+        consistency_boost = min(np.log1p(s["active_days"]), 2)
+        return round(v * consistency_boost * 100, 2)
 
     def tier(sc):
-        if sc>=80: return "A+"
-        if sc>=65: return "A"
-        if sc>=50: return "B"
+        if sc >= 140: return "A+++"
+        if sc >= 130: return "A++"
+        if sc >= 110: return "A+"
+        if sc >= 100: return "A"
+        if sc >= 80: return "B"
+        if sc >= 50: return "C"
         return "IGNORE"
 
-    ranked=[]
-    for w,s in candidates:
-        sc=score(s)
-        t=tier(sc)
-        if t!="IGNORE":
+    ranked = []
+    for w, s in candidates:
+        sc = score(s)
+        t = tier(sc)
+        if t != "IGNORE":
             ranked.append({
-                "wallet":w,
-                "score":sc,
-                "tier":t,
-                **{k: round(v,2) if isinstance(v,float) else v for k,v in s.items()}
+                "wallet": w,
+                "score": sc,
+                "tier": t,
+                **{k: round(v, 2) if isinstance(v, float) else v for k, v in s.items()}
             })
-    ranked.sort(key=lambda x:x["score"], reverse=True)
+
+    ranked.sort(key=lambda x: x["score"], reverse=True)
     return ranked[:TOP_N]
 
 # ---------- verification & graphing ----------
@@ -246,7 +263,6 @@ def verify_wallet(wallet_address, trades, stats=None, index=None):
     if not pnl: return
 
     cum_pnl = np.cumsum(pnl)
-    # Save graph without showing
     plt.figure(figsize=(10,4))
     plt.plot(timestamps, cum_pnl, marker='o')
     plt.title(f"Wallet {wallet_address} - Cumulative PnL")
@@ -260,15 +276,8 @@ def verify_wallet(wallet_address, trades, stats=None, index=None):
     plt.savefig(os.path.join(GRAPH_DIR, filename))
     plt.close()
 
-    # --- Save wallet data + stats, minified and trimmed ---
     essential_trade_fields = ["market_slug","outcome","side","size","price","createdAt","timestamp"]
-
-    trimmed_trades = [
-        {k: t[k] for k in essential_trade_fields if k in t}
-        for t in wallet_trades
-    ]
-
-    # Limit to last 50 trades
+    trimmed_trades = [{k: t[k] for k in essential_trade_fields if k in t} for t in wallet_trades]
     trimmed_trades = trimmed_trades[-MAX_TRADES:]
 
     wallet_data = {
@@ -279,7 +288,7 @@ def verify_wallet(wallet_address, trades, stats=None, index=None):
 
     data_filename = f"{index:02d}_{wallet_address}.json" if index is not None else f"{wallet_address}.json"
     with open(os.path.join(TOP_DATA_DIR, data_filename), "w") as f:
-        json.dump(wallet_data, f, separators=(',', ':'))  # minified JSON
+        json.dump(wallet_data, f, separators=(',', ':'))
 
 # ---------- main ----------
 def main():
@@ -300,7 +309,6 @@ def main():
 
     ranked = compute_scores(candidates)
 
-    # Save minified top wallets JSON
     with open(OUTPUT_FILE,"w") as f:
         json.dump(ranked, f, separators=(',', ':'))
 
@@ -324,7 +332,6 @@ def main():
     print(tabulate(table, headers=headers, tablefmt="grid"))
     print(f"Saved {len(ranked)} wallets → {OUTPUT_FILE}")
 
-    # Generate verification graphs & save top wallet data
     for idx, w in enumerate(ranked[:TOP_N], start=1):
         verify_wallet(w["wallet"], trades, stats=w, index=idx)
 
