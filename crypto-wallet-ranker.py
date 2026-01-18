@@ -14,18 +14,18 @@ from tabulate import tabulate
 import matplotlib.pyplot as plt
 
 # ---- CONFIG ----
-DATA_DIR = "data/raw"            # partitioned JSON files directory
-OUTPUT_FILE = "data/top_wallets.json"
+DATA_DIR = "data/wallet-ranker/raw"            # partitioned JSON files directory
+OUTPUT_FILE = "data/wallet-ranker/top_wallets.json"
 LOOKBACK_DAYS = 180
 RECENT_DAYS = 30
 
-MIN_REALIZED_TRADES = 6 # 10
+MIN_REALIZED_TRADES = 1 # 10
 MAX_DRAWDOWN = 0.6
 TOP_N = 25
 SECONDS_IN_DAY = 86400
 SHARPE_CAP = 5.0                 # cap to prevent extreme Sharpe scores
-GRAPH_DIR = "data/graphs"
-TOP_DATA_DIR = "data/top_wallet_data"
+GRAPH_DIR = "data/wallet-ranker/graphs"
+TOP_DATA_DIR = "data/wallet-ranker/top_wallet_data"
 MAX_TRADES = 50  # limit to last 50 trades per wallet
 
 # Ensure directories exist
