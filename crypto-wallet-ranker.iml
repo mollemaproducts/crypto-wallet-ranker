@@ -8,4 +8,7 @@
     <orderEntry type="jdk" jdkName="Python 3.13 (crypto-wallet-ranker)" jdkType="Python SDK" />
     <orderEntry type="sourceFolder" forTests="false" />
   </component>
+  <component name="SonarLintModuleSettings">
+    <option name="uniqueId" value="b7259a42-57d2-4fab-9222-1887672a6ce7" />
+  </component>
 </module>
